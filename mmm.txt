@@ -1,0 +1,102 @@
+---
+- name: Create VM snapshots from inventory hosts
+  hosts: rhel
+  gather_facts: false
+  collections:
+    - nutanix.ncp
+
+  tasks:
+    - name: Validate the inventory infrastructure selector
+      ansible.builtin.assert:
+        that:
+          - (s_infra | default('vmware') | lower) in ['vmware', 'ntnx']
+        fail_msg: >-
+          Invalid s_infra value for {{ inventory_hostname }}.
+          Use 'ntnx' for Acropolis, 'vmware', or omit it for VMware.
+
+    - name: Derive the ServiceNow lookup name and snapshot name
+      ansible.builtin.set_fact:
+        snapshot_provider: "{{ s_infra | default('vmware') | lower }}"
+        inventory_vm_name: "{{ inventory_hostname.split('.')[0] | upper }}"
+        snapshot_name: >-
+          {{ inventory_hostname }}_{{ lookup('env', 'JOB_ID')
+          | default(lookup('env', 'AWX_JOB_ID'), true)
+          | default('manual', true) }}_{{ now(utc=true, fmt='%Y%m%d_%H%M%S') }}
+
+    - name: Query ServiceNow for the inventory host CI
+      ansible.builtin.uri:
+        url: "{{ lookup('env', 'SERVICENOW_INSTANCE') }}/api/now/table/cmdb_ci_vm_instance?sysparm_query=nameLIKE{{ inventory_vm_name | urlencode }}&sysparm_fields=name,u_vcenter&sysparm_limit=100"
+        method: GET
+        user: "{{ lookup('env', 'SERVICENOW_USERNAME') }}"
+        password: "{{ lookup('env', 'SERVICENOW_PASSWORD') }}"
+        force_basic_auth: true
+        validate_certs: true
+        return_content: true
+        status_code: 200
+        body_format: json
+        headers:
+          Accept: application/json
+      register: servicenow_response
+      no_log: true
+
+    - name: Match the ServiceNow CI by exact hostname, ignoring case and domain
+      ansible.builtin.set_fact:
+        servicenow_vm_matches: >-
+          {{ servicenow_response.json.result
+             | selectattr('name', 'defined')
+             | selectattr(
+                 'name',
+                 'match',
+                 '(?i)^' ~ (inventory_vm_name | regex_escape) ~ '(\\..*)?$'
+               )
+             | list }}
+
+    - name: Validate the ServiceNow CI result
+      ansible.builtin.assert:
+        that:
+          - servicenow_vm_matches | length == 1
+        fail_msg: >-
+          Expected exactly one ServiceNow VM CI matching {{ inventory_vm_name }},
+          found {{ servicenow_vm_matches | length }}.
+
+    - name: Validate that VMware CI includes a vCenter
+      ansible.builtin.assert:
+        that:
+          - servicenow_vm_matches[0].u_vcenter | default('') | length > 0
+        fail_msg: "ServiceNow CI {{ servicenow_vm_matches[0].name }} has no vCenter."
+      when: snapshot_provider == 'vmware'
+
+    - name: Use the VM name and vCenter returned by ServiceNow
+      ansible.builtin.set_fact:
+        vm_name: "{{ servicenow_vm_matches[0].name }}"
+        vcenter_name: "{{ servicenow_vm_matches[0].u_vcenter | default('') }}"
+
+    - name: Create Acropolis snapshot
+      nutanix.ncp.ntnx_vms_snapshots:
+        nutanix_host: "{{ lookup('env', 'NUTANIX_HOST') }}"
+        nutanix_username: "{{ lookup('env', 'NUTANIX_USERNAME') }}"
+        nutanix_password: "{{ lookup('env', 'NUTANIX_PASSWORD') }}"
+        validate_certs: false
+        vm_name: "{{ vm_name }}"
+        snapshot_name: "{{ snapshot_name }}"
+        state: present
+      register: snapshot_result
+      when: snapshot_provider == 'ntnx'
+
+    - name: Create VMware snapshot
+      community.vmware.vmware_guest_snapshot:
+        hostname: "{{ vcenter_name }}"
+        username: "{{ lookup('env', 'VMWARE_USERNAME') }}"
+        password: "{{ lookup('env', 'VMWARE_PASSWORD') }}"
+        validate_certs: false
+        datacenter: "{{ lookup('env', 'VMWARE_DATACENTER') }}"
+        name: "{{ vm_name }}"
+        snapshot_name: "{{ snapshot_name }}"
+        state: present
+      delegate_to: localhost
+      register: snapshot_result
+      when: snapshot_provider == 'vmware'
+
+    - name: Display snapshot result
+      ansible.builtin.debug:
+        var: snapshot_result
