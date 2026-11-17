@@ -1,0 +1,7 @@
+__pycache__/
+.venv/
+.env
+.streamlit/secrets.toml
+generated/*
+!generated/.gitkeep
+.pytest_cache/
